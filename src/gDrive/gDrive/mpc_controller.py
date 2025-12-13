@@ -17,13 +17,13 @@ class MPCController:
 
         # --- 2. MPC Weights (The Tuning Knobs) ---
         # Q: State Error Penalty [x, y, theta]
-        self.Q = np.diag([100.0, 100.0, 10.0])
+        self.Q = np.diag([20.0, 20.0, 100.0])
 
         # R: Input Penalty [v, w]
-        self.R = np.diag([1.0, 10.0])
+        self.R = np.diag([0.01, 0.001])
 
         # Rd: Input/slew Rate Penalty [dv, dw]
-        self.Rd = np.diag([5.0, 50.0])
+        self.Rd = np.diag([0.1, 0.01])
 
 
     def get_linear_model(self, x_ref, u_ref):
@@ -93,7 +93,7 @@ class MPCController:
             print("MPC problem not solved optimally.")
             return np.array([0.0, 0.0])  # Return zero commands on failure
         
-        return U[:, 0].value
+        return U[:, 0].value , X.value
     
 
 
