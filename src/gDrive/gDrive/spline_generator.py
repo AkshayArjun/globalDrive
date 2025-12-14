@@ -103,6 +103,7 @@ class FastSplineGenerator:
         coeffs = np.einsum('ij,sjk->sik', self.M, G)
 
         full_traj = []
+        current_global_time = 0.0
 
         for i in range(len(T)):
             # Discretize based on desired spacing
@@ -111,6 +112,7 @@ class FastSplineGenerator:
                 num_steps = 2
             
             u = np.linspace(0, 1, num_steps)
+            seg_time = current_global_time + (u * T[i])
             
             # Position: polynomial evaluation
             U_pow = np.stack([np.ones_like(u), u, u**2, u**3, u**4, u**5])
@@ -132,12 +134,14 @@ class FastSplineGenerator:
             w_ref = np.divide(cross_prod, v_mag**2, out=np.zeros_like(cross_prod), where=v_mag > 0.01)
 
             # Stack: [x, y, theta, v, w]
-            seg_data = np.column_stack([seg_pos, theta, v_mag, w_ref])
+            seg_data = np.column_stack([seg_pos, theta, v_mag, w_ref , seg_time,])
             
             # Avoid duplicate points between segments
             if i > 0:
                 seg_data = seg_data[1:]
                 
             full_traj.append(seg_data)
+
+            current_global_time += T[i]
 
         return np.vstack(full_traj)

@@ -190,7 +190,7 @@ class NavigationNode(Node):
         horizon_ref = []
         for k in range(self.controller.N):
             idx = min(self.current_path_index + k, len(self.global_path) - 1)
-            horizon_ref.append(self.global_path[idx])
+            horizon_ref.append(self.global_path[idx, :5])
         horizon_ref = np.array(horizon_ref)
         
         # Solve MPC
