@@ -2,98 +2,162 @@ import numpy as np
 import cvxpy as cp
 
 class MPCController:
-    def __init__(self, horizon=20, dt=0.1):
+    def __init__(self, horizon=20, dt=0.02):  # Note: Default dt=0.02 (50Hz)
         self.N = horizon
         self.dt = dt
 
-        # acc to turtle bot - waffle pi documentation  :
-        #max speed = 0.26m/s
-        #max angular speed = 1.82rad/s
+        # --- Robot Constraints ---
+        self.v_max = 0.26
+        self.v_min = 0 # Allow reversing
+        self.w_max = 1.82
+        
+        # Acceleration limits (Now these are the INPUT limits)
+        self.acc_v_max = 0.5   # m/s^2
+        self.acc_w_max = 3.0   # rad/s^2
 
-        # --- 1. User Defined Constraints ---
-        self.v_max = 0.26  # m/s
-        self.v_min = -0.26 # m/s
-        self.w_max = 1.82  # rad/s
+        # --- Tuning Weights (Delta Formulation) ---
+        
+        # Q: State Penalty [x, y, theta, v, w]
+        # We now track velocity errors directly in the state cost
+        self.Q = np.diag([150.0, 150.0, 1.0, 5.0, 8.5])
 
-        # --- 2. MPC Weights (The Tuning Knobs) ---
-        # Q: State Error Penalty [x, y, theta]
-        self.Q = np.diag([20.0, 20.0, 100.0])
+        # R: Input Penalty [delta_v, delta_w]
+        # This penalizes CHANGE in velocity (smoothness)
+        self.R = np.diag([1, 0.01])
+        
+        # Terminal weight
+        self.terminal_weight = 100.0
 
-        # R: Input Penalty [v, w]
-        self.R = np.diag([0.01, 0.001])
-
-        # Rd: Input/slew Rate Penalty [dv, dw]
-        self.Rd = np.diag([0.1, 0.01])
-
-
-    def get_linear_model(self, x_ref, u_ref):
+    def get_augmented_model(self, x_lin, u_lin):
         """
-        Get the linearized discrete-time model matrices A, B around the reference state and input.
-        x_ref: [x, y, theta]
-        u_ref: [v, w]
+        Returns linearized model for state [x, y, theta, v, w]
+        and input [delta_v, delta_w]
         """
-        theta = x_ref[2]
-        v = u_ref[0]
+        theta = x_lin[2]
+        v = x_lin[3] # Velocity is now part of the state
+        
+        # Singularity Fix: Ghost velocity
+        if abs(v) < 1e-3:
+            v = 1e-3
 
-        A_c = np.array([
-            [0, 0, -v * np.sin(theta)],
-            [0, 0,  v * np.cos(theta)],
-            [0, 0, 0]
-        ])
+        # Jacobian w.r.t State (5x5)
+        # x_next = x + v*cos(th)*dt
+        # v_next = v + delta_v (so v depends on v with factor 1)
+        A = np.eye(5)
+        
+        # Partial derivatives for Position w.r.t Theta
+        A[0, 2] = -v * np.sin(theta) * self.dt
+        A[1, 2] =  v * np.cos(theta) * self.dt
+        
+        # Partial derivatives for Position w.r.t Velocity
+        A[0, 3] = np.cos(theta) * self.dt
+        A[1, 3] = np.sin(theta) * self.dt
+        
+        # Theta depends on w
+        A[2, 4] = self.dt 
 
-        B_c = np.array([
-            [np.cos(theta), 0],
-            [np.sin(theta), 0],
-            [0, 1]  
-        ])
+        # Jacobian w.r.t Input (Deltas) (5x2)
+        # v_next = v + delta_v  => 1.0 effect
+        # w_next = w + delta_w  => 1.0 effect
+        B = np.zeros((5, 2))
+        B[3, 0] = 1.0  # Effect of delta_v on v
+        B[4, 1] = 1.0  # Effect of delta_w on w
 
-        #now we have x[t + 1] = (A_c*dt + I)*x[t] + B_c*dt*u[t]
-
-        a_d = np.eye(3) + A_c * self.dt
-        b_d = B_c * self.dt
-
-        return a_d, b_d
+        return A, B
     
-    def solve(self, current_state, ref_trajectory):
-        X = cp.Variable((3, self.N + 1))  # States over horizon
-        U = cp.Variable((2, self.N))      # Inputs over horizon
+    def solve(self, current_pose, ref_trajectory, last_u):
+        """
+        Args:
+            current_pose: [x, y, theta]
+            ref_trajectory: Nx5 array [x, y, theta, v, w]
+            last_u: [v_current, w_current] (The starting velocity)
+        """
+
+        ref_traj_adjusted = ref_trajectory.copy()
+        current_theta = current_pose[2]
+
+        diff = ref_traj_adjusted[0, 2] - current_theta
+        diff = (diff + np.pi) % (2 * np.pi) - np.pi
+        ref_traj_adjusted[0, 2] = current_theta + diff
+
+        for i in range(1, len(ref_traj_adjusted)):
+            diff = ref_traj_adjusted[i, 2] - ref_traj_adjusted[i-1, 2]
+            diff = (diff + np.pi) % (2 * np.pi) - np.pi
+            ref_traj_adjusted[i, 2] = ref_traj_adjusted[i-1, 2] + diff
+
+        # 1. Setup Augmented State
+        # Current state includes the velocity we are moving at RIGHT NOW
+        if last_u is None:
+            last_u = np.array([0.0, 0.0])
+            
+        x0 = np.concatenate([current_pose, last_u]) # Size 5
+        
+        X = cp.Variable((5, self.N + 1))  # State: [x, y, th, v, w]
+        U = cp.Variable((2, self.N))      # Input: [dv, dw] (Acceleration * dt)
 
         cost = 0
         constraints = []
 
-        constraints.append(X[:, 0] == current_state)
+        # Initial Condition
+        constraints.append(X[:, 0] == x0)
+        
+        # Linearization point (updated in loop)
+        x_pred = x0.copy()
 
         for k in range(self.N):
-            ref_idx = min(k, len(ref_trajectory) - 1)
-            x_r = ref_trajectory[ref_idx, :3]
-            u_r = ref_trajectory[ref_idx, 3:]
+            # Reference
+            ref_idx = min(k, len(ref_traj_adjusted) - 1)
+            # Ref state is full [x, y, th, v, w]
+            state_ref = ref_traj_adjusted[ref_idx] 
+            
+            # Linearize
+            # Note: We pass 0 for u_lin because B matrix is constant 
+            # for this formulation, but we need x_pred for A matrix.
+            A_k, B_k = self.get_augmented_model(x_pred, None)
+            
+            # Dynamics
+            constraints.append(X[:, k + 1] == A_k @ X[:, k] + B_k @ U[:, k])
+            
+            # Update prediction (simple Euler for the loop)
+            # x_pred is updated assuming zero acceleration for linearization
+            x_pred = A_k @ x_pred 
 
-            Ak, Bk = self.get_linear_model(x_r, u_r)
-
-            constraints.append(X[:, k + 1] == Ak @ X[:, k] + Bk @ U[:, k])
-
-            state_error = X[:, k] - x_r
+            # --- Cost ---
+            state_error = X[:, k] - state_ref
             cost += cp.quad_form(state_error, self.Q)
 
-            input_error = U[:, k] - u_r
-            cost += cp.quad_form(input_error, self.R)
+            # Penalize high acceleration (smoothness)
+            cost += cp.quad_form(U[:, k], self.R)
 
-            if k > 0:
-                delta_u = U[:, k] - U[:, k - 1]
-                cost += cp.quad_form(delta_u, self.Rd)
+            # --- Constraints ---
+            
+            # 1. Hard limits on Velocity (State Constraints)
+            constraints.append(X[3, k+1] <= self.v_max)
+            constraints.append(X[3, k+1] >= self.v_min)
+            constraints.append(cp.abs(X[4, k+1]) <= self.w_max)
+            
+            # 2. Hard limits on Acceleration (Input Constraints)
+            # Note: U is change per step, so limit is acc_max * dt
+            constraints.append(cp.abs(U[0, k]) <= self.acc_v_max * self.dt)
+            constraints.append(cp.abs(U[1, k]) <= self.acc_w_max * self.dt)
 
-            constraints.append(U[0, k] <= self.v_max)
-            constraints.append(U[0, k] >= self.v_min)
-            constraints.append(cp.abs(U[1, k]) <= self.w_max)
-        
+        # Terminal Cost
+        term_ref = ref_trajectory[min(self.N, len(ref_trajectory)-1)]
+        cost += cp.quad_form(X[:, self.N] - term_ref, self.Q * self.terminal_weight)
+
+        # Solve
         prob = cp.Problem(cp.Minimize(cost), constraints)
-        prob.solve(solver=cp.OSQP)
+        prob.solve(solver=cp.OSQP, verbose=False, eps_abs=1e-3, eps_rel=1e-3)
 
         if prob.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
-            print("MPC problem not solved optimally.")
-            return np.array([0.0, 0.0])  # Return zero commands on failure
+            print(f"MPC Warning: {prob.status}")
+            return np.array([0.0, 0.0]), None
+
+        # Return the NEW velocity command (v_next = v_curr + delta)
+        # This is found in the second column of the State matrix (index 1)
+        # X[:, 1] is the state at k=1
+        cmd_v = X[3, 1].value
+        cmd_w = X[4, 1].value
         
-        return U[:, 0].value , X.value
-    
-
-
+        # Return command and full trajectory (x,y part only) for viz
+        return np.array([cmd_v, cmd_w]), X[:3, :].value

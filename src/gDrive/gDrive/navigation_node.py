@@ -2,6 +2,8 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Path, Odometry
+from rclpy.qos import qos_profile_sensor_data
+from ament_index_python.packages import get_package_share_directory
 
 import numpy as np
 import plotly.graph_objects as go
@@ -10,173 +12,283 @@ import math
 
 from gDrive.mpc_controller import MPCController
 from gDrive.spline_generator import FastSplineGenerator
+from gDrive.waypoint_loader import WaypointLoader
 
 class NavigationNode(Node):
     def __init__(self):
         super().__init__('navigation_node')
 
-        #node settings:
-        self.control_rate = 10
+        # Control settings
+        self.control_rate = 10.0  # Hz
         self.dt = 1.0 / self.control_rate
-        self.goal_tolerance = 0.15
+        self.goal_tolerance = 0.2  # Tighter tolerance
 
-        #way points: 
-         # tbd by reading from a file or parameter
-        self.waypoints = [
-            [0.0, 0.0],   # Start
-            
-            # Corner 1 (Bottom Right)
-            [1.5, 0.0],   # Start turning here
-            [2.0, 0.5],   # Finish turning here
-            
-            # Corner 2 (Top Right)
-            [2.0, 1.5],   # Start turning
-            [1.5, 2.0],   # Finish turning
-            
-            # Corner 3 (Top Left)
-            [0.5, 2.0],   # Start turning
-            [0.0, 1.5],   # Finish turning
-            
-            # Corner 4 (Back Home)
-            [0.0, 0.5],   # Start turning
-            [0.0, 0.0]    # Finish at home
-        ]
+        try:
+            pkg_share = get_package_share_directory('gDrive')
+            csv_path = os.path.join(pkg_share, 'resource', 'mission.csv')
+            self.get_logger().info(f"Loading waypoints from: {csv_path}")
+            loader = WaypointLoader()
+            self.waypoints = loader.load_from_csv(csv_path)
+        
+        except Exception as e:
+            self.get_logger().error(f"Failed to load waypoints: {e}")
+            self.waypoints = []
+        
+        if not self.waypoints:
+            self.get_logger().info("Using default square waypoints.")
+            self.waypoints = [
+                [0.0, 0.0],
+                [2.0, 0.0],
+                [2.0, 2.0],
+                [0.0, 2.0],
+                [0.0, 0.0]
+            ]
 
-        #initialise the classes:
-        self.controller = MPCController(horizon=20, dt=self.dt)
+        # Initialize controller with shorter horizon for faster computation
+        self.controller = MPCController(horizon=50, dt=self.dt)
         self.planner = FastSplineGenerator()
 
-        #generate the global path:
-        self.global_path = self.planner.generate(self.waypoints, avg_speed=0.2, ds=0.05)
-        if self.global_path is None:
-            self.get_logger().error("Failed to generate global path from waypoints.")
-            return
+        # Generate reference path with tighter corners
+        self.global_path = self.planner.generate(
+            self.waypoints, 
+            avg_speed=0.15, 
+            ds=0.02, 
+            corner_sharpness=0.2 
+        )
+        self.last_closest_idx = 0
         
-        self.get_logger().info(f"Generated global path with {len(self.global_path)} points.")
+        if self.global_path is None:
+            self.get_logger().error("Failed to generate global path.")
+            return
+        self.get_logger().info(f"Generated path with {len(self.global_path)} points.")
 
+        # Tracking history
         self.history_x = []
         self.history_y = []
+        self.history_time = []
+        self.start_time = None
 
-        #pubs and subs:
+        # ROS publishers and subscribers
         self.cmd_pub = self.create_publisher(Twist, 'cmd_vel', 10)
         self.path_pub = self.create_publisher(Path, 'global_path', 10)
-        self.mpc_path_pub = self.create_publisher(Path, 'mpc_predicted', 10)   
-
-        self.odom_sub = self.create_subscription(Odometry, 'odom', self.odom_callback, 10)
-
+        self.mpc_path_pub = self.create_publisher(Path, 'mpc_predicted', 1)   
+        self.odom_sub = self.create_subscription(
+            Odometry, 'odom', self.odom_callback, qos_profile_sensor_data
+        )
+        
+        # Control loop timer
         self.create_timer(1.0 / self.control_rate, self.control_loop)
 
+        # State variables
         self.robot_state = None
         self.current_path_index = 0
         self.complete = False
+        self.last_u = np.array([0.0, 0.0])
+        
+        # Performance tracking
+        self.tracking_errors = []
 
     def odom_callback(self, msg):
+        if self.start_time is None:
+            self.start_time = self.get_clock().now()
+            
         x = msg.pose.pose.position.x
         y = msg.pose.pose.position.y
-
         q = msg.pose.pose.orientation
         _, _, yaw = self.euler_from_quaternion([q.x, q.y, q.z, q.w])
-        self.robot_state = np.array([x, y, yaw])
+       
+
+        v_linear = msg.twist.twist.linear.x
+        w_angular = msg.twist.twist.angular.z
+        self.robot_state = np.array([x, y, yaw, v_linear, w_angular])
 
     def find_closest_index(self, state):
-        search_window = 100 
-        start_i = self.current_path_index
-        end_i = min(start_i + search_window, len(self.global_path))
+        """Find closest point on path with local search."""
+        # Search locally around current index
+        search_range = 150
+        start_i = max(0, self.current_path_index - 20)
+        end_i = min(start_i + search_range, len(self.global_path))
         
-        # Calculate distances to all points in window
-        dists = np.linalg.norm(self.global_path[start_i:end_i, :2] - state[:2], axis=1)
+        # Compute distances
+        dists = np.linalg.norm(
+            self.global_path[start_i:end_i, :2] - state[:2], 
+            axis=1
+        )
         
-        # Return global index of the closest point
-        best_local_idx = np.argmin(dists)
-        return start_i + best_local_idx
+        best_idx = start_i + np.argmin(dists)
+        return best_idx
 
     def control_loop(self):
+    
         if self.robot_state is None:
             self.get_logger().info("Waiting for odometry...", throttle_duration_sec=2.0)
             return
         
+        curr_pose = self.robot_state[:3]
+        current_vel = self.robot_state[3:]
+        
         if self.complete:
-            self.stop_robot()
             return
         
+        curr_closest = self.find_closest_index(self.robot_state)
+
+        if curr_closest < self.last_closest_idx:
+            closest_idx = self.last_closest_idx
+        else:
+            closest_idx = curr_closest
+            self.last_closest_idx = closest_idx
+        
+        # Record trajectory
         self.history_x.append(self.robot_state[0])
         self.history_y.append(self.robot_state[1])
+        current_time = (self.get_clock().now() - self.start_time).nanoseconds / 1e9
+        self.history_time.append(current_time)
 
-        closest_idx = self.find_closest_index(self.robot_state)
-        self.current_path_index = closest_idx
 
-        dist_to_end = np.linalg.norm(self.robot_state[:2] - self.global_path[-1, :2])
-        near_end_of_array = (self.current_path_index >= len(self.global_path) - 5)
-        if dist_to_end < self.goal_tolerance and near_end_of_array:
-            self.get_logger().info("Goal Reached!")
+        # CRITICAL: Use adaptive lookahead based on current speed
+        # Faster speeds need more lookahead
+        if len(self.history_x) > 1:
+            prev_pos = np.array([self.history_x[-2], self.history_y[-2]])
+            current_speed = np.linalg.norm(self.robot_state[:2] - prev_pos) / self.dt
+        else:
+            current_speed = 0.0
+        
+        # Lookahead: 2-6 points depending on speed (reduced for tighter tracking)
+        lookahead = int(np.clip(2 + current_speed * 20, 2, 6))
+        self.current_path_index = min(
+            closest_idx + lookahead, 
+            len(self.global_path) - 1
+        )
+
+        # Check if goal reached
+        dist_to_goal = np.linalg.norm(
+            self.robot_state[:2] - self.global_path[-1, :2]
+        )
+        near_end = closest_idx >= len(self.global_path) - 20
+        
+        if dist_to_goal < self.goal_tolerance and near_end:
+            self.get_logger().info("=== Goal Reached! ===")
             self.complete = True
             self.stop_robot()
+            self.generate_report()
             return
         
+        # Build MPC horizon reference
         horizon_ref = []
         for k in range(self.controller.N):
             idx = min(self.current_path_index + k, len(self.global_path) - 1)
             horizon_ref.append(self.global_path[idx])
-        
         horizon_ref = np.array(horizon_ref)
-        optimal_u, pred_traj = self.controller.solve(self.robot_state, horizon_ref)
-        if pred_traj is not None:
+        
+        # Solve MPC
+        optimal_u, pred_traj = self.controller.solve(
+            curr_pose, 
+            horizon_ref,
+            current_vel
+        )
+        
+        # Track prediction for visualization
+        if pred_traj is not None and not np.isnan(pred_traj).any():
             self.publish_mpc_prediction(pred_traj)
+        else:
+            self.get_logger().warn("MPC Prediction contains NaNs - skipping viz")
+        
+        # Compute and log tracking error
+        ref_point = self.global_path[closest_idx, :2]
+        error = np.linalg.norm(self.robot_state[:2] - ref_point)
+        self.tracking_errors.append(error)
+        
+        if len(self.tracking_errors) % 50 == 0:
+            avg_error = np.mean(self.tracking_errors[-50:])
+            self.get_logger().info(
+                f"Progress: {100*closest_idx/len(self.global_path):.1f}% | "
+                f"Error: {error:.3f}m | Avg: {avg_error:.3f}m"
+            )
 
+        # Publish control command
         cmd = Twist()
         cmd.linear.x = float(optimal_u[0])
         cmd.angular.z = float(optimal_u[1])
         self.cmd_pub.publish(cmd)
 
-        self.publish_viz_path()
+        # Publish path visualization periodically
+        if len(self.history_x) % 10 == 0:
+            self.publish_viz_path()
     
     def generate_report(self):
-        self.get_logger().info("Plotting Trajectory...")
+        self.get_logger().info("Generating trajectory report...")
+        
+        # Calculate statistics
+        errors = np.array(self.tracking_errors)
+        mean_error = np.mean(errors)
+        max_error = np.max(errors)
+        std_error = np.std(errors)
         
         fig = go.Figure()
 
-        # Trace 1: The Reference Path (Green)
+        # Reference path
         fig.add_trace(go.Scatter(
-            x=self.global_path[:, 0], y=self.global_path[:, 1],
-            mode='lines', name='Reference Path',
-            line=dict(color='green', width=3, dash='dash')
+            x=self.global_path[:, 0], 
+            y=self.global_path[:, 1],
+            mode='lines', 
+            name='Reference Path',
+            line=dict(color='green', width=2, dash='dash')
         ))
 
-        # Trace 2: The Actual Robot Path (Blue)
+        # Actual robot path
         fig.add_trace(go.Scatter(
-            x=self.history_x, y=self.history_y,
-            mode='lines', name='Actual Robot Path',
+            x=self.history_x, 
+            y=self.history_y,
+            mode='lines', 
+            name='Robot Path',
             line=dict(color='blue', width=3)
         ))
 
-        # Trace 3: Start/End Markers
+        # Waypoints
+        wp_array = np.array(self.waypoints)
         fig.add_trace(go.Scatter(
-            x=[self.waypoints[0][0], self.waypoints[-1][0]],
-            y=[self.waypoints[0][1], self.waypoints[-1][1]],
-            mode='markers', name='Start/End',
+            x=wp_array[:, 0], 
+            y=wp_array[:, 1],
+            mode='markers', 
+            name='Waypoints',
             marker=dict(size=12, color='red', symbol='star')
         ))
 
         fig.update_layout(
-            title="MPC Mission Report: Reference vs Actual",
+            title=f"MPC Tracking Report<br>" +
+                  f"<sub>Mean Error: {mean_error:.3f}m | " +
+                  f"Max Error: {max_error:.3f}m | " +
+                  f"Std Dev: {std_error:.3f}m</sub>",
             xaxis_title="X Position (m)",
             yaxis_title="Y Position (m)",
             yaxis=dict(scaleanchor="x", scaleratio=1),
-            template="plotly_white"
+            template="plotly_white",
+            width=900,
+            height=700
         )
 
-        # Save to file
         save_path = os.path.expanduser("~/mission_result.html")
         fig.write_html(save_path)
-        self.get_logger().info(f"REPORT SAVED TO: {save_path}")
+        self.get_logger().info(f"Report saved: {save_path}")
+        
+        # Print summary
+        self.get_logger().info(
+            f"\n=== Performance Summary ===\n"
+            f"Mean tracking error: {mean_error:.3f} m\n"
+            f"Max tracking error:  {max_error:.3f} m\n"
+            f"Std deviation:       {std_error:.3f} m\n"
+            f"Mission time:        {self.history_time[-1]:.1f} s\n"
+            f"=========================="
+        )
     
     def stop_robot(self):
+        """Send zero velocity command."""
         cmd = Twist()
-        cmd.linear.x = 0.0
-        cmd.angular.z = 0.0
-        self.cmd_pub.publish(cmd)
+        for _ in range(5):  # Send multiple times to ensure it's received
+            self.cmd_pub.publish(cmd)
     
     def publish_viz_path(self):
+        """Publish reference path for RViz visualization."""
         path_msg = Path()
         path_msg.header.frame_id = "odom"
         path_msg.header.stamp = self.get_clock().now().to_msg()
@@ -184,7 +296,7 @@ class NavigationNode(Node):
         for point in self.global_path[::5]:
             pose = PoseStamped()
             pose.header = path_msg.header
-            pose.pose.position.x = float(point[0])
+            pose.pose.position.x = float(point[0]) 
             pose.pose.position.y = float(point[1])
             pose.pose.position.z = 0.0
             path_msg.poses.append(pose)
@@ -192,49 +304,49 @@ class NavigationNode(Node):
         self.path_pub.publish(path_msg)
     
     def publish_mpc_prediction(self, pred_traj):
+        """Publish MPC predicted trajectory."""
         path_msg = Path()
         path_msg.header.frame_id = "odom"
         path_msg.header.stamp = self.get_clock().now().to_msg()
 
-        num_points = pred_traj.shape[1]
-        for i in range(num_points):
+        for i in range(pred_traj.shape[1]):
             pose = PoseStamped()
             pose.header = path_msg.header
             pose.pose.position.x = float(pred_traj[0, i])
             pose.pose.position.y = float(pred_traj[1, i])
-            pose.pose.position.z = 0.0
+            pose.pose.position.z = 0.3
             path_msg.poses.append(pose)
         
         self.mpc_path_pub.publish(path_msg)
 
     def euler_from_quaternion(self, quat):
-        """
-        Convert quaternion (x, y, z, w) to Euler angles (roll, pitch, yaw)
-        """
+        """Convert quaternion to Euler angles."""
         x, y, z, w = quat
-        t0 = +2.0 * (w * x + y * z)
-        t1 = +1.0 - 2.0 * (x * x + y * y)
-        roll_x = math.atan2(t0, t1)
+        
+        t0 = 2.0 * (w * x + y * z)
+        t1 = 1.0 - 2.0 * (x * x + y * y)
+        roll = math.atan2(t0, t1)
 
-        t2 = +2.0 * (w * y - z * x)
-        t2 = +1.0 if t2 > +1.0 else t2
-        t2 = -1.0 if t2 < -1.0 else t2
-        pitch_y = math.asin(t2)
+        t2 = 2.0 * (w * y - z * x)
+        t2 = np.clip(t2, -1.0, 1.0)
+        pitch = math.asin(t2)
 
-        t3 = +2.0 * (w * z + x * y)
-        t4 = +1.0 - 2.0 * (y * y + z * z)
-        yaw_z = math.atan2(t3, t4)
+        t3 = 2.0 * (w * z + x * y)
+        t4 = 1.0 - 2.0 * (y * y + z * z)
+        yaw = math.atan2(t3, t4)
 
-        return roll_x, pitch_y, yaw_z
+        return roll, pitch, yaw
 
 def main(args=None):
     rclpy.init(args=args)
     node = NavigationNode()
+    
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info('Keyboard Interrupt (Ctrl+C) Detected!')
-        node.generate_report()
+        node.get_logger().info('Interrupted by user')
+        if not node.complete:
+            node.generate_report()
     finally:
         node.stop_robot()
         node.destroy_node()
