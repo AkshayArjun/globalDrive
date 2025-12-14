@@ -58,16 +58,8 @@ use this file to add the waypoints to the global planner
 ## running the simulation
 
 ```bash
-# to launch the simulation 
-ros2 launch turtlebot3_gazebo empty_world.launch.py 
-
-# in a seperate terminal
-ros2 run gDrive navigation_node
-
-#and to visualise the paths in another terminal
-rviz2 
-
-#tbd ( create a single run launch file)
+#simply use the launch file : 
+ros2 launch gDrive simulation.launch.py 
 ```
 ---
 # results 
@@ -77,15 +69,22 @@ rviz2
 ![SplineGen](media/spline_gen.png)
 
 ### Lpv - mpc controller output : 
-![lpvmpc](media/final.png)
-[**comment:** It should be noted that the controller isnt best tuned and further tunign can improve the performance ]
+#### 1). Straight line:
+![straightline](media/straight_line.png)
+
+#### 2). Square: 
+![square](media/square.png)
+
+#### 3). ZigZag:
+![zigzag](media/zigzag.png)
+
+#### 4). Random set of points: 
+![lpvmpc](media/mpc_path.png)
+[**comment:** It should be noted that the controller isn't best tuned and further tunign can improve the performance ]
 
 ### Demo video :
 
-#### click here for the demo run [video](insert link here)
-
-
-
+#### click here for the demo run [video](media/lpv_mpc_demo.webm)
 
 
 # License 

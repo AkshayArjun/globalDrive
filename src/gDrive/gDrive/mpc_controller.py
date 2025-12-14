@@ -18,8 +18,8 @@ class MPCController:
         # --- Tuning Weights ---
         # Note: Tuning often needs re-adjustment when adding C matrix
         # because the model is now "stiffer" and more accurate.
-        self.Q = np.diag([200.0, 200.0, 100.0, 5.0, 200.0]) 
-        self.R = np.diag([10.0, 100.0])
+        self.Q = np.diag([200.0, 200.0, 100.0, 50.0, 200.0]) 
+        self.R = np.diag([100.0, 100.0])
         self.terminal_weight = 50.0
 
     def get_nonlinear_next_state(self, x, u_delta=np.array([0,0])):
