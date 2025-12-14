@@ -2,4 +2,7 @@ src/turtlebot3_simulations
 build
 install
 log
-src/gDrive/test
+src/gDrive/test/test_copyright.py
+src/gDrive/test/test_flake8.py
+src/gDrive/test/test_pep257.py
+

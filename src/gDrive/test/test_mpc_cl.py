@@ -1,6 +1,13 @@
 import numpy as np
 import plotly.graph_objects as go
-from mpc_controller import MPCController
+import sys
+import os
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(os.path.dirname(current_dir))
+sys.path.append(parent_dir)
+
+from gDrive.gDrive.mpc_controller import MPCController
 
 def simulate_robot_motion(state, u, dt):
     """
