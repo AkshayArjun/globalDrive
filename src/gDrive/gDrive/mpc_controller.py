@@ -148,14 +148,7 @@ class MPCController:
         prob.solve(solver=cp.OSQP, verbose=False, eps_abs=1e-3, eps_rel=1e-3)
 
         if prob.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
-            # Fallback: Just stop if optimization fails
             return np.array([0.0, 0.0]), None
-
-        # Calculate Commands
-        # The solver gave us the OPTIMAL STATE sequence.
-        # X[:, 1] is the state at the NEXT timestep.
-        # X[3, 1] is the optimal Velocity at k=1.
-        # X[4, 1] is the optimal Omega at k=1.
         
         cmd_v = X[3, 1].value
         cmd_w = X[4, 1].value
