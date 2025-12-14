@@ -5,6 +5,8 @@ Is a ROS2 project that simulates the motion of a differntial drive robot, all th
 
 This Project leverages the existing turtlebot3 waffle gazebo simulation setup, inorder to streamline the process.
 
+for more details regarding architecture, algorithmn selection, etc. please refer to [THEORY.md](THEORY.md)
+
 ## Project status : 
 
 **path_smoothening** : implemented quinitc hermite spline \
