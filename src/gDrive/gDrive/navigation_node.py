@@ -2,6 +2,7 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Path, Odometry
+from sensor_msgs.msg import LaserScan
 from rclpy.qos import qos_profile_sensor_data
 from ament_index_python.packages import get_package_share_directory
 
@@ -13,6 +14,7 @@ import math
 from gDrive.mpc_controller import MPCController
 from gDrive.spline_generator import FastSplineGenerator
 from gDrive.waypoint_loader import WaypointLoader
+from gDrive.c3bf_filter import LidarTracker, C3BFSolver
 
 class NavigationNode(Node):
     def __init__(self):
@@ -48,6 +50,10 @@ class NavigationNode(Node):
         self.controller = MPCController(horizon=50, dt=self.dt)
         self.planner = FastSplineGenerator()
 
+        self.lidar_tracker = LidarTracker()
+        self.safety_solver = C3BFSolver(lookahead_l=0.2)
+        self.obstacle_state = None
+
         # Generate reference path with tighter corners
         self.global_path = self.planner.generate(
             self.waypoints, 
@@ -62,11 +68,7 @@ class NavigationNode(Node):
             return
         self.get_logger().info(f"Generated path with {len(self.global_path)} points.")
 
-        # Tracking history
-        self.history_x = []
-        self.history_y = []
-        self.history_time = []
-        self.start_time = None
+        
 
         # ROS publishers and subscribers
         self.cmd_pub = self.create_publisher(Twist, 'cmd_vel', 10)
@@ -74,6 +76,9 @@ class NavigationNode(Node):
         self.mpc_path_pub = self.create_publisher(Path, 'mpc_predicted', 1)   
         self.odom_sub = self.create_subscription(
             Odometry, 'odom', self.odom_callback, qos_profile_sensor_data
+        )
+        self.lidar_sub = self.create_subscription(
+            LaserScan, 'scan', self.scan_callback, qos_profile_sensor_data
         )
         
         # Control loop timer
@@ -87,6 +92,11 @@ class NavigationNode(Node):
         
         # Performance tracking
         self.tracking_errors = []
+        # Tracking history
+        self.history_x = []
+        self.history_y = []
+        self.history_time = []
+        self.start_time = None
 
     def odom_callback(self, msg):
         if self.start_time is None:
@@ -101,6 +111,9 @@ class NavigationNode(Node):
         v_linear = msg.twist.twist.linear.x
         w_angular = msg.twist.twist.angular.z
         self.robot_state = np.array([x, y, yaw, v_linear, w_angular])
+    
+    def scan_callback(self, msg):
+        self.obstacle_state = self.lidar_tracker.process_scan(msg)
 
     def find_closest_index(self, state):
         """Find closest point on path with local search."""
@@ -186,7 +199,40 @@ class NavigationNode(Node):
             horizon_ref,
             current_vel
         )
+
+        safe_u = optimal_u
+
+        if self.obstacle_state is not None:
+            safe_v, safe_w = self.safety_solver.solve(
+                current_vel,
+                optimal_u,
+                self.obstacle_state
+            )
+
+            if optimal_u[0] > 0.1 and safe_v < 0.05:
+                self.get_logger().warn("Blocked by obstacle! Initiating Evasive Maneuver.")
+                
+                # Force a rotation to find a clear path
+                safe_v = 0.0
+                safe_w = 0.4  # Rotate left in place
+                
+                # (Advanced: Check obstacle_state.y to decide left/right turn)
+                # If obstacle is to our left (cy > 0), turn right (negative w)
+                cx, cy, _, _, _ = self.obstacle_state
+                if cy > 0: 
+                    safe_w = -0.4
+            
+            # Update the command
+            safe_u = np.array([safe_v, safe_w])
+
         
+        # Publish control command
+        cmd = Twist()
+        cmd.linear.x = float(safe_u[0])
+        cmd.angular.z = float(safe_u[1])
+        self.cmd_pub.publish(cmd)
+
+        self.last_u = safe_u
         # Track prediction for visualization
         if pred_traj is not None and not np.isnan(pred_traj).any():
             self.publish_mpc_prediction(pred_traj)
@@ -205,11 +251,6 @@ class NavigationNode(Node):
                 f"Error: {error:.3f}m | Avg: {avg_error:.3f}m"
             )
 
-        # Publish control command
-        cmd = Twist()
-        cmd.linear.x = float(optimal_u[0])
-        cmd.angular.z = float(optimal_u[1])
-        self.cmd_pub.publish(cmd)
 
         # Publish path visualization periodically
         if len(self.history_x) % 10 == 0:
