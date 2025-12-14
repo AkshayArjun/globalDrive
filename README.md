@@ -5,6 +5,14 @@ Is a ROS2 project that simulates the motion of a differntial drive robot, all th
 
 This Project leverages the existing turtlebot3 waffle gazebo simulation setup, inorder to streamline the process.
 
+## Project status : 
+
+**path_smoothening** : implemented quinitc hermite spline \
+**trajectory_generation** : done alogn with quintic hermite spline \
+**trajectory_tracking_controller** : implemented LPV MPC for trajectory tracking \
+**obstacle_avoidance** : tried implementing CBF (C3BF to be exact) - incomplete \
+**test_generation** : have 3 test codes to test the algorithmns [here](src/gDrive/test/)
+
 ---
 # Project requirements
 
@@ -63,7 +71,7 @@ ros2 launch gDrive simulation.launch.py
 ```
 ---
 # results 
-
+#### [NOTE] after every run , a file mission_result.html is made in the home directory 
 ### Spline generation : 
 
 ![SplineGen](media/spline_gen.png)
