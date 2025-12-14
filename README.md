@@ -72,15 +72,15 @@ rviz2
 ---
 # results 
 
-### spline generation : 
+### Spline generation : 
 
 ![SplineGen](media/spline_gen.png)
 
-### lpv - mpc controller output : 
+### Lpv - mpc controller output : 
 ![lpvmpc](media/final.png)
 [**comment:** It should be noted that the controller isnt best tuned and further tunign can improve the performance ]
 
-### demo video :
+### Demo video :
 
 #### click here for the demo run [video](insert link here)
 
@@ -88,3 +88,5 @@ rviz2
 
 
 
+# License 
+This project is licensed under the GNU GPL v3 [LICENSE](LICENSE)
