@@ -52,7 +52,7 @@ source install/setup.bash
 
 # usage:
 ## mission planning 
-Inside gDrive package find the file name **mission.csv** under **/gDrive/resources** 
+Inside gDrive package find the file name **mission.csv** under ```/gDrive/resources```
 use this file to add the waypoints to the global planner
 
 ## running the simulation
